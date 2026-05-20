@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: background-remover-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: REPLICATE_API_TOKEN
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: APP_API_KEY
+        sync: false
+      - key: MAX_FILE_MB
+        value: 15
+      - key: FILE_TTL_HOURS
+        value: 24

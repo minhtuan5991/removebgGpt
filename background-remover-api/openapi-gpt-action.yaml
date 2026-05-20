@@ -1,0 +1,57 @@
+openapi: 3.1.0
+info:
+  title: Background Remover API
+  version: 1.0.0
+  description: Remove image background and return a transparent PNG URL.
+servers:
+  - url: https://YOUR-RENDER-APP.onrender.com
+paths:
+  /remove-background:
+    post:
+      operationId: removeBackground
+      summary: Remove background from an uploaded image and return transparent PNG URL
+      parameters:
+        - in: header
+          name: x-api-key
+          required: false
+          schema:
+            type: string
+          description: Optional API key if APP_API_KEY is configured on the server.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Image file to remove background from. Supports PNG, JPG, JPEG, WEBP.
+              required:
+                - file
+      responses:
+        "200":
+          description: Transparent PNG result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  png_url:
+                    type: string
+                    description: Public URL of the transparent PNG result.
+                  filename:
+                    type: string
+                  expires_after_hours:
+                    type: integer
+        "400":
+          description: Invalid image file
+        "401":
+          description: Invalid or missing API key
+        "413":
+          description: File too large
+        "500":
+          description: Background removal failed
