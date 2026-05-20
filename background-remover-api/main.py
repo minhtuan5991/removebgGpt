@@ -106,7 +106,7 @@ async def remove_background(file: UploadFile = File(...)):
 
         with open(temp_input_path, "rb") as image_file:
             output = replicate.run(
-                "cjwbw/rembg",
+                "cjwbw/rembg:fb8af171cfa1610a9b2044da04e50135cc65450680a7d5344f987fb5bf3db574",
                 input={"image": image_file}
             )
 
