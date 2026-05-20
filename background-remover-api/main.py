@@ -4,34 +4,54 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import replicate
 
 load_dotenv()
 
+# =========================
+# ENV CONFIG
+# =========================
+
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 APP_API_KEY = os.getenv("APP_API_KEY", "")
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "output_files"))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "15"))
 FILE_TTL_HOURS = int(os.getenv("FILE_TTL_HOURS", "24"))
 
 if not REPLICATE_API_TOKEN:
-    raise RuntimeError("Missing REPLICATE_API_TOKEN. Please set it in Render Environment Variables or .env")
+    raise RuntimeError("Missing REPLICATE_API_TOKEN environment variable")
+
+if not PUBLIC_BASE_URL:
+    raise RuntimeError("Missing PUBLIC_BASE_URL environment variable")
 
 os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Replicate rembg model version
+# Source: https://replicate.com/cjwbw/rembg/versions/fb8af171cfa1616ddcf1242c093f9c46bcada5ad4cf6f2fbe8b81b330ec5c003
+REMBG_MODEL_VERSION = (
+    "cjwbw/rembg:"
+    "fb8af171cfa1616ddcf1242c093f9c46bcada5ad4cf6f2fbe8b81b330ec5c003"
+)
+
+OUTPUT_DIR = Path("output_files")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+# =========================
+# APP INIT
+# =========================
 
 app = FastAPI(
     title="Background Remover API",
-    description="Remove image background with Replicate rembg and return transparent PNG URL.",
     version="1.0.0",
+    description="Remove image background with Replicate rembg and return transparent PNG URL.",
 )
 
 app.add_middleware(
@@ -45,82 +65,146 @@ app.add_middleware(
 app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
 
 
-def verify_api_key(x_api_key: Optional[str] = Header(default=None)):
-    """Optional API key protection. If APP_API_KEY is empty, the API is open."""
-    if APP_API_KEY and x_api_key != APP_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
+# =========================
+# HELPERS
+# =========================
+
+def check_api_key(x_api_key: str | None):
+    """
+    If APP_API_KEY is set, request must include matching x-api-key header.
+    """
+    if APP_API_KEY:
+        if not x_api_key or x_api_key != APP_API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
 
 
 def cleanup_old_files():
-    """Delete generated files older than FILE_TTL_HOURS."""
+    """
+    Delete old generated PNG files to prevent storage from growing forever.
+    """
     now = time.time()
     ttl_seconds = FILE_TTL_HOURS * 3600
-    for file_path in OUTPUT_DIR.glob("*.png"):
+
+    for file_path in OUTPUT_DIR.glob("*"):
         try:
-            if now - file_path.stat().st_mtime > ttl_seconds:
-                file_path.unlink(missing_ok=True)
+            if file_path.is_file():
+                age = now - file_path.stat().st_mtime
+                if age > ttl_seconds:
+                    file_path.unlink()
         except Exception:
             pass
 
+
+def validate_upload(file: UploadFile):
+    filename = file.filename or ""
+    ext = Path(filename).suffix.lower()
+
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Please upload JPG, JPEG, PNG, or WEBP.",
+        )
+
+    return ext
+
+
+def save_upload_to_temp(file: UploadFile, suffix: str) -> str:
+    """
+    Save uploaded image to a temporary file.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        temp_path = tmp.name
+
+    file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+    if file_size_mb > MAX_FILE_MB:
+        os.remove(temp_path)
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Max file size is {MAX_FILE_MB}MB.",
+        )
+
+    return temp_path
+
+
+def normalize_replicate_output(output):
+    """
+    Replicate output may be:
+    - a string URL
+    - a list containing URL
+    - a FileOutput-like object
+    """
+    if isinstance(output, list):
+        if not output:
+            raise RuntimeError("Replicate returned empty output list")
+        return str(output[0])
+
+    return str(output)
+
+
+def download_result_png(result_url: str) -> str:
+    """
+    Download PNG from Replicate result URL and save it locally.
+    """
+    response = requests.get(result_url, timeout=180)
+    response.raise_for_status()
+
+    output_filename = f"{uuid.uuid4()}.png"
+    output_path = OUTPUT_DIR / output_filename
+
+    with open(output_path, "wb") as f:
+        f.write(response.content)
+
+    return output_filename
+
+
+# =========================
+# ROUTES
+# =========================
 
 @app.get("/")
 def root():
     return {
         "status": "ok",
         "message": "Background Remover API is running",
-        "docs": f"{PUBLIC_BASE_URL}/docs",
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "model": REMBG_MODEL_VERSION,
+    }
 
 
-@app.post("/remove-background", dependencies=[Depends(verify_api_key)])
-async def remove_background(file: UploadFile = File(...)):
+@app.post("/remove-background")
+async def remove_background(
+    file: UploadFile = File(...),
+    x_api_key: str | None = Header(default=None),
+):
+    """
+    Upload an image, remove background, and return transparent PNG URL.
+    """
+    check_api_key(x_api_key)
     cleanup_old_files()
 
-    allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
-    if file.content_type not in allowed_types:
-        raise HTTPException(status_code=400, detail="Only PNG, JPG, JPEG, and WEBP images are supported")
-
+    suffix = validate_upload(file)
     temp_input_path = None
 
     try:
-        suffix = Path(file.filename or "image.png").suffix.lower()
-        if suffix not in [".png", ".jpg", ".jpeg", ".webp"]:
-            suffix = ".png"
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            size = 0
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_FILE_MB * 1024 * 1024:
-                    raise HTTPException(status_code=413, detail=f"File too large. Max size is {MAX_FILE_MB}MB")
-                tmp.write(chunk)
-            temp_input_path = tmp.name
+        temp_input_path = save_upload_to_temp(file, suffix)
 
         with open(temp_input_path, "rb") as image_file:
             output = replicate.run(
-                "cjwbw/rembg:fb8af171cfa1610a9b2044da04e50135cc65450680a7d5344f987fb5bf3db574",
-                input={"image": image_file}
+                REMBG_MODEL_VERSION,
+                input={
+                    "image": image_file,
+                },
             )
 
-        if isinstance(output, list):
-            result_url = str(output[0])
-        else:
-            result_url = str(output)
-
-        result_response = requests.get(result_url, timeout=180)
-        result_response.raise_for_status()
-
-        output_filename = f"{uuid.uuid4()}.png"
-        output_path = OUTPUT_DIR / output_filename
-        output_path.write_bytes(result_response.content)
+        result_url = normalize_replicate_output(output)
+        output_filename = download_result_png(result_url)
 
         png_url = f"{PUBLIC_BASE_URL}/files/{output_filename}"
 
@@ -128,13 +212,20 @@ async def remove_background(file: UploadFile = File(...)):
             "success": True,
             "png_url": png_url,
             "filename": output_filename,
-            "expires_after_hours": FILE_TTL_HOURS,
         }
 
     except HTTPException:
         raise
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Background removal failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Background removal failed: {type(e).__name__}: {str(e)}",
+        )
+
     finally:
         if temp_input_path and os.path.exists(temp_input_path):
-            os.remove(temp_input_path)
+            try:
+                os.remove(temp_input_path)
+            except Exception:
+                pass
